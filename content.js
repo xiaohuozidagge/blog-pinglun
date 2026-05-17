@@ -2327,6 +2327,136 @@
     });
   }
 
+  /**
+   * 同时检测 AJAX 提交请求和页面导航，任一发生即 resolve
+   * 用于：点击提交按钮后，等待表单提交（不管页面是否跳转）
+   * @param {number} timeoutMs - 超时毫秒数
+   * @returns {Promise<string>} 'ajax' | 'navigating' | 'pagehide' | 'timeout'
+   */
+  function waitForSubmitOrNavigate(timeoutMs = 10000) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      function finish(result) {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
+        resolve(result);
+      }
+      function cleanup() {
+        clearTimeout(timer);
+        document.removeEventListener('submit', onSubmit, true);
+        if (window.XMLHttpRequest) {
+          window.XMLHttpRequest.prototype.open = originalXHROpen;
+        }
+        if (window.fetch) {
+          window.fetch = originalFetch;
+        }
+        window.removeEventListener('beforeunload', onBeforeUnload);
+        window.removeEventListener('pagehide', onPageHide);
+      }
+      function onSubmit(e) { finish('ajax'); }
+      function onBeforeUnload() { finish('navigating'); }
+      function onPageHide(e) { finish(e.persisted ? 'pagehide' : 'pagehide'); }
+
+      // 拦截 fetch
+      const originalFetch = window.fetch;
+      window.fetch = function(input, init) {
+        if (!resolved && isFormSubmitUrl(input)) finish('ajax');
+        return originalFetch.apply(this, arguments);
+      };
+
+      // 拦截 XHR
+      const originalXHROpen = window.XMLHttpRequest.prototype.open;
+      window.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        if (!resolved && isFormSubmitUrl(url)) finish('ajax');
+        return originalXHROpen.call(this, method, url, ...rest);
+      };
+
+      document.addEventListener('submit', onSubmit, true);
+      window.addEventListener('beforeunload', onBeforeUnload);
+      window.addEventListener('pagehide', onPageHide);
+
+      const timer = setTimeout(() => finish('timeout'), timeoutMs);
+    });
+  }
+
+  /**
+   * 拦截表单提交请求（拦截 fetch/XHR），用于检测 AJAX 类型的评论提交
+   * 返回一个 Promise，resolve(true) 表示检测到提交请求发出，resolve(false) 表示超时
+   * @param {number} timeoutMs - 超时毫秒数
+   */
+  function setupAjaxSubmitDetection(timeoutMs = 10000) {
+    return new Promise((resolve) => {
+      let detected = false;
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+
+      function cleanup() {
+        clearTimeout(timer);
+        document.removeEventListener('submit', onSubmit, true);
+        if (window.XMLHttpRequest) {
+          window.XMLHttpRequest.prototype.open = originalXHROpen;
+        }
+        if (window.fetch) {
+          window.fetch = originalFetch;
+        }
+      }
+
+      function onSubmit(e) {
+        if (detected) return;
+        detected = true;
+        cleanup();
+        resolve(true);
+      }
+
+      // 拦截原生 fetch
+      const originalFetch = window.fetch;
+      window.fetch = function(input, init) {
+        if (!detected && isFormSubmitUrl(input)) {
+          detected = true;
+          cleanup();
+          resolve(true);
+        }
+        return originalFetch.apply(this, arguments);
+      };
+
+      // 拦截 XMLHttpRequest
+      const originalXHROpen = window.XMLHttpRequest.prototype.open;
+      window.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        if (!detected && isFormSubmitUrl(url)) {
+          detected = true;
+          cleanup();
+          resolve(true);
+        }
+        return originalXHROpen.call(this, method, url, ...rest);
+      };
+
+      // 监听表单 submit 事件（catch 所有未拦截到的表单）
+      document.addEventListener('submit', onSubmit, true);
+    });
+  }
+
+  /**
+   * 判断 URL 是否可能是评论表单提交地址
+   * 排除静态资源和图片，只拦截看起来像 API/表单提交的 URL
+   */
+  function isFormSubmitUrl(url) {
+    if (!url) return false;
+    const s = String(url).toLowerCase();
+    // 排除静态资源和常见非提交地址
+    const excludePatterns = [
+      /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|webp|mp4|webm|ogg|mp3|wav|zip|tar|gz)$/,
+      /google-analytics|googletagmanager|doubleclick|facebook\.com\/tr|analytics|tracking|pixel/i,
+      /\/wp-admin\/admin-ajax/,
+    ];
+    for (const p of excludePatterns) {
+      if (p.test(s)) return false;
+    }
+    return true;
+  }
+
   // 执行点击操作
   async function performClick(button) {
     console.log('[AutoComment] 找到提交按钮:', {
@@ -2427,16 +2557,18 @@
         recordFormSubmit();
 
         console.log('[AutoComment] 提交按钮点击成功 (pointer/mousedown→mouseup→click)');
-        await waitForNavigate(8000);
-        return { success: true, button: button };
+        const submitResult = await waitForSubmitOrNavigate(10000);
+        console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+        return { success: true, button: button, submitResult: submitResult };
       } catch (e) {
         console.log('[AutoComment] 合成事件失败，尝试 button.click():', e.message);
         try {
           button.click();
           recordFormSubmit();
           console.log('[AutoComment] button.click() 点击成功');
-          await waitForNavigate(8000);
-          return { success: true, button: button };
+          const submitResult = await waitForSubmitOrNavigate(10000);
+          console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+          return { success: true, button: button, submitResult: submitResult };
         } catch (e2) {
           console.log('[AutoComment] button.click() 也失败:', e2.message);
 
@@ -2444,16 +2576,18 @@
           if (tryRequestSubmit(formEl, button)) {
             recordFormSubmit();
             console.log('[AutoComment] form.requestSubmit(submitter) 成功');
-            await waitForNavigate(8000);
-            return { success: true, button: button };
+            const submitResult = await waitForSubmitOrNavigate(10000);
+            console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+            return { success: true, button: button, submitResult: submitResult };
           }
           try {
             if (formEl) {
               console.log('[AutoComment] 降级 form.submit()（无 submit 事件）');
               formEl.submit();
               recordFormSubmit();
-              await waitForNavigate(8000);
-              return { success: true, button: button };
+              const submitResult = await waitForSubmitOrNavigate(10000);
+              console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+              return { success: true, button: button, submitResult: submitResult };
             }
           } catch (e3) {
             console.log('[AutoComment] 表单提交也失败:', e3.message);
@@ -2474,8 +2608,9 @@
         button.dispatchEvent(event);
         recordFormSubmit();
         console.log('[AutoComment] 使用 dispatchEvent 点击成功');
-        await waitForNavigate(8000);
-        return { success: true, button: button };
+        const submitResult = await waitForSubmitOrNavigate(10000);
+        console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+        return { success: true, button: button, submitResult: submitResult };
       } catch (e2) {
         console.log('[AutoComment] dispatchEvent 点击也失败:', e2.message);
 
@@ -2483,16 +2618,18 @@
         if (tryRequestSubmit(formEl, button)) {
           recordFormSubmit();
           console.log('[AutoComment] form.requestSubmit(submitter) 成功');
-          await waitForNavigate(8000);
-          return { success: true, button: button };
+          const submitResult = await waitForSubmitOrNavigate(10000);
+          console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+          return { success: true, button: button, submitResult: submitResult };
         }
         try {
           if (formEl) {
             console.log('[AutoComment] 尝试 form.submit()');
             formEl.submit();
             recordFormSubmit();
-            await waitForNavigate(8000);
-            return { success: true, button: button };
+            const submitResult = await waitForSubmitOrNavigate(10000);
+            console.log('[AutoComment] waitForSubmitOrNavigate 结果:', submitResult);
+            return { success: true, button: button, submitResult: submitResult };
           }
         } catch (e3) {
           console.log('[AutoComment] 表单提交失败:', e3.message);
@@ -3591,10 +3728,22 @@
       console.log('[content] 7/7 点击提交按钮...');
       const clickResult = await clickCommentSubmitButton();
       console.log('[content] 点击结果:', clickResult);
-      // performClick 已等待页面跳转/隐藏（最多8秒），此时 content script 上下文仍存活
-      // 若 timeout 说明页面未响应，算失败；否则表单已提交，记录成功
       if (!clickResult.success) {
         throw new Error(clickResult.error || '提交按钮点击失败');
+      }
+
+      // 检测表单是否成功提交：页面跳转、AJAX 请求、或表单被清空任一发生即确认成功
+      const submitResult = clickResult.submitResult || 'timeout';
+      if (submitResult === 'timeout') {
+        // 超时后检查表单是否被清空（评论框内容消失表示提交成功）
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const ta = findLikelyCommentTextarea({ allowGenericFallback: true });
+        const formCleared = !ta || !ta.value.trim();
+        console.log('[content] 超时检测表单状态:', { formCleared, textareaValue: ta ? ta.value.substring(0, 50) : 'not found' });
+        if (!formCleared) {
+          throw new Error('提交超时，表单未被清空');
+        }
+        console.log('[content] 表单已清空，确认为 AJAX 提交成功');
       }
 
       // 页面点击成功后，通知 background 再次落盘（防止刷新导致 context 丢失）
