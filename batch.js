@@ -2,6 +2,7 @@
 
 // ==================== 配置 ====================
 const API_BASE = 'https://jieyunsang.cn/api';
+const BLOG_RUN_STATS_ENDPOINT = `${API_BASE}/blog-run-stats`;
 const POLL_INTERVAL = 3000;
 const TIMEOUT_CHECK_INTERVAL = 5000;
 const TIMEOUT_STORAGE_KEY = 'batch_timeout_seconds';
@@ -788,6 +789,8 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
 
   localResults.push(resultEntry);
 
+  reportBlogRunStatsIfNeeded(item, result);
+
   if (result === 'success') {
     successCount++;
     highlightPreviewRow(urlIndex, 'success');
@@ -827,6 +830,64 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     shouldComplete: processedCount >= totalCount
   });
   checkAllCompleted(options);
+}
+
+function reportBlogRunStatsIfNeeded(item, result) {
+  if (result !== 'success' && result !== 'manual_required') return;
+
+  const payload = buildBlogRunStatsPayload(item, result);
+  if (!payload.urlDomain) return;
+
+  try {
+    fetch(BLOG_RUN_STATS_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function buildBlogRunStatsPayload(item, result) {
+  const row = Array.isArray(item && item.originalRow) ? item.originalRow : [];
+  const originalUrl = (item && item.url) || normalizeUrlForStats(row[1]);
+  const urlDomain = normalizeDomainForStats(row[2] || (item && item.sourceDomain) || extractDomain(originalUrl));
+  const targetDomain = normalizeDomainForStats(row[3]);
+
+  return {
+    pageAs: normalizeStatValue(row[0]),
+    originalUrl,
+    urlDomain,
+    targetDomain,
+    type: normalizeStatValue(row[4]),
+    externalLinkCount: parseIntegerForStats(row[5]),
+    validationResult: result === 'success' ? 1 : 2
+  };
+}
+
+function normalizeStatValue(value) {
+  return String(value || '').trim();
+}
+
+function normalizeUrlForStats(value) {
+  const text = normalizeStatValue(value);
+  if (!text) return '';
+  return /^https?:\/\//i.test(text) ? text : `https://${text}`;
+}
+
+function normalizeDomainForStats(value) {
+  const text = normalizeStatValue(value);
+  if (!text) return '';
+  try {
+    return new URL(normalizeUrlForStats(text)).hostname.replace(/^www\./i, '').toLowerCase();
+  } catch (_) {
+    return text.replace(/^www\./i, '').toLowerCase();
+  }
+}
+
+function parseIntegerForStats(value) {
+  const parsed = parseInt(String(value || '').replace(/[^\d-]/g, ''), 10);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 // background 通知：结果已落盘，可以安全关闭标签页了
