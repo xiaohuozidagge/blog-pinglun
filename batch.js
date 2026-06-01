@@ -844,8 +844,16 @@ function reportBlogRunStatsIfNeeded(item, result) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       keepalive: true
-    }).catch(() => {});
-  } catch (_) {}
+    }).then((response) => {
+      if (!response.ok) {
+        console.warn('[batch] blog-run-stats 上报失败:', response.status, payload);
+      }
+    }).catch((error) => {
+      console.warn('[batch] blog-run-stats 上报异常:', error, payload);
+    });
+  } catch (error) {
+    console.warn('[batch] blog-run-stats 上报启动失败:', error, payload);
+  }
 }
 
 function buildBlogRunStatsPayload(item, result) {
