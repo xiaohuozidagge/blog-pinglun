@@ -12,7 +12,7 @@ async function persistBatchReport(message) {
   console.log('[background] persistBatchReport >>>', { batchId, urlIndex, url: pageUrl, result, aiContentLen: aiContent ? aiContent.length : 0, errorMessage, time: new Date().toISOString() });
 
   const data = await chrome.storage.local.get(['batchResults', 'batchReportedUrls']);
-  const results = data.batchResults || [];
+  const results = Array.isArray(data.batchResults) ? data.batchResults : [];
   const entry = {
     batchId,
     urlIndex,
@@ -22,7 +22,12 @@ async function persistBatchReport(message) {
     errorMessage,
     timestamp: Date.now()
   };
-  results.push(entry);
+  const existingIndex = results.findIndex((item) => item.batchId === batchId && item.urlIndex === urlIndex);
+  if (existingIndex >= 0) {
+    results[existingIndex] = { ...results[existingIndex], ...entry };
+  } else {
+    results.push(entry);
+  }
   if (results.length > 100) results.shift();
 
   let reported = data.batchReportedUrls || [];

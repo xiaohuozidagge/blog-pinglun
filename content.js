@@ -4251,7 +4251,7 @@
       const data = await new Promise((resolve) => {
         chrome.storage.local.get(['batchResults', 'batchReportedUrls'], (d) => resolve(d));
       });
-      const results = data.batchResults || [];
+      const results = Array.isArray(data.batchResults) ? data.batchResults : [];
       const entry = {
         batchId,
         urlIndex,
@@ -4261,9 +4261,14 @@
         errorMessage,
         timestamp: Date.now()
       };
-      results.push(entry);
+      const existingIndex = results.findIndex((item) => item.batchId === batchId && item.urlIndex === urlIndex);
+      if (existingIndex >= 0) {
+        results[existingIndex] = { ...results[existingIndex], ...entry };
+      } else {
+        results.push(entry);
+      }
       if (results.length > 100) results.shift();
-      const reported = data.batchReportedUrls || [];
+      const reported = Array.isArray(data.batchReportedUrls) ? data.batchReportedUrls : [];
       const urlKey = `${batchId}:${urlIndex}`;
       if (!reported.includes(urlKey)) {
         reported.push(urlKey);
@@ -4338,8 +4343,8 @@
         const data = await new Promise((resolve) => {
           chrome.storage.local.get(['batchResults', 'batchReportedUrls'], (d) => resolve(d));
         });
-        const results = data.batchResults || [];
-        results.push({
+        const results = Array.isArray(data.batchResults) ? data.batchResults : [];
+        const entry = {
           batchId,
           urlIndex,
           url: pageUrl || '',
@@ -4347,9 +4352,15 @@
           aiContent,
           errorMessage,
           timestamp: Date.now()
-        });
+        };
+        const existingIndex = results.findIndex((item) => item.batchId === batchId && item.urlIndex === urlIndex);
+        if (existingIndex >= 0) {
+          results[existingIndex] = { ...results[existingIndex], ...entry };
+        } else {
+          results.push(entry);
+        }
         if (results.length > 100) results.shift();
-        const reported = data.batchReportedUrls || [];
+        const reported = Array.isArray(data.batchReportedUrls) ? data.batchReportedUrls : [];
         const urlKey = `${batchId}:${urlIndex}`;
         if (!reported.includes(urlKey)) {
           reported.push(urlKey);
