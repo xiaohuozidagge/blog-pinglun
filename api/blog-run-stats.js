@@ -27,19 +27,19 @@ async function ensureTable() {
       await execute(
         `
           CREATE TABLE IF NOT EXISTS blog_run_stats (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            page_as VARCHAR(255) DEFAULT '',
-            original_url TEXT NOT NULL,
-            url_domain VARCHAR(255) NOT NULL,
-            target_domain VARCHAR(255) DEFAULT '',
-            link_type VARCHAR(255) DEFAULT '',
-            external_link_count INT NOT NULL DEFAULT 0,
-            validation_result TINYINT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+            page_as VARCHAR(255) DEFAULT '' COMMENT '导入CSV中的页面AS值',
+            original_url TEXT NOT NULL COMMENT '批量任务处理的原始URL',
+            url_domain VARCHAR(255) NOT NULL COMMENT '从原始URL提取并规范化后的域名',
+            target_domain VARCHAR(255) DEFAULT '' COMMENT '评论或外链任务的目标域名',
+            link_type VARCHAR(255) DEFAULT '' COMMENT '导入CSV中的链接类型',
+            external_link_count INT NOT NULL DEFAULT 0 COMMENT '导入CSV中的外部链接数量',
+            validation_result TINYINT NOT NULL COMMENT '验证结果：1=成功，2=失败或需手动处理',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间',
             PRIMARY KEY (id),
             UNIQUE KEY uk_blog_run_stats_url_domain (url_domain)
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='批量博客运行结果统计表'
         `,
         []
       );
