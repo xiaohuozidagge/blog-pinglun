@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { AlipaySdk } = require('alipay-sdk');
 
 const { execute, getPool, query, queryOne } = require('./db');
@@ -7,6 +8,9 @@ const router = express.Router();
 
 const ACTIVE_ORDER_STATUSES = ['pending_payment', 'paid_pending_fulfillment'];
 const PAID_TRADE_STATUSES = ['TRADE_SUCCESS', 'TRADE_FINISHED'];
+const PAYMENT_TIMEOUT_EXPRESS = '2h';
+const PAYMENT_TIMEOUT_SECONDS = 2 * 60 * 60;
+const PAYMENT_TIMEOUT_MS = PAYMENT_TIMEOUT_SECONDS * 1000;
 
 const PLANS = {
   blog_250: {
@@ -53,6 +57,37 @@ function getGateway() {
     : 'https://openapi-sandbox.dl.alipaydev.com/gateway.do';
 }
 
+function maskAppId(appId) {
+  const value = String(appId || '').trim();
+  if (!value) return '';
+  return value.length <= 4 ? '*'.repeat(value.length) : `${'*'.repeat(value.length - 4)}${value.slice(-4)}`;
+}
+
+function getConfigDiagnostics() {
+  const appId = String(process.env.ALIPAY_APP_ID || '').trim();
+  const gateway = getGateway();
+  const env = getAlipayEnv();
+  const expectedGateway = env === 'production'
+    ? 'https://openapi.alipay.com/gateway.do'
+    : 'https://openapi-sandbox.dl.alipaydev.com/gateway.do';
+
+  return {
+    env,
+    gateway,
+    gatewayMatchesEnv: gateway === expectedGateway,
+    appIdMasked: maskAppId(appId),
+    appIdLength: appId.length,
+    hasPrivateKey: !!String(process.env.ALIPAY_PRIVATE_KEY || '').trim(),
+    hasAlipayPublicKey: !!String(process.env.ALIPAY_PUBLIC_KEY || '').trim(),
+    keyType: String(process.env.ALIPAY_KEY_TYPE || 'PKCS8').trim().toUpperCase()
+  };
+}
+
+function logConfigDiagnostics() {
+  const diagnostics = getConfigDiagnostics();
+  console.info('[alipay] config diagnostics:', diagnostics);
+}
+
 function wrapPem(value, type) {
   const raw = String(value || '').replace(/\\n/g, '\n').trim();
   if (!raw) return '';
@@ -67,8 +102,40 @@ function wrapPem(value, type) {
   ].join('\n');
 }
 
-function normalizePrivateKey(value, keyType) {
-  return wrapPem(value, keyType === 'PKCS1' ? 'RSA PRIVATE KEY' : 'PRIVATE KEY');
+function parsePrivateKey(value, configuredKeyType) {
+  const raw = String(value || '').replace(/\\n/g, '\n').trim();
+  const normalizedConfiguredKeyType = configuredKeyType === 'PKCS1' ? 'PKCS1' : 'PKCS8';
+  if (!raw) {
+    throw new Error('缺少环境变量 ALIPAY_PRIVATE_KEY');
+  }
+
+  const candidates = [];
+  if (raw.includes('-----BEGIN RSA PRIVATE KEY-----')) {
+    candidates.push({ keyType: 'PKCS1', privateKey: raw });
+  } else if (raw.includes('-----BEGIN PRIVATE KEY-----')) {
+    candidates.push({ keyType: 'PKCS8', privateKey: raw });
+  } else if (raw.includes('-----BEGIN ENCRYPTED PRIVATE KEY-----')) {
+    throw new Error('ALIPAY_PRIVATE_KEY 是加密私钥，当前服务不支持带密码私钥，请使用支付宝工具导出的未加密应用私钥');
+  } else if (raw.includes('-----BEGIN')) {
+    throw new Error('ALIPAY_PRIVATE_KEY 不是支持的 RSA 私钥格式，请使用 PKCS8 或 PKCS1 应用私钥');
+  } else {
+    const firstType = normalizedConfiguredKeyType;
+    const secondType = firstType === 'PKCS8' ? 'PKCS1' : 'PKCS8';
+    candidates.push({ keyType: firstType, privateKey: wrapPem(raw, firstType === 'PKCS1' ? 'RSA PRIVATE KEY' : 'PRIVATE KEY') });
+    candidates.push({ keyType: secondType, privateKey: wrapPem(raw, secondType === 'PKCS1' ? 'RSA PRIVATE KEY' : 'PRIVATE KEY') });
+  }
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      crypto.createPrivateKey(candidate.privateKey);
+      return candidate;
+    } catch (error) {
+      errors.push(`${candidate.keyType}: ${error.message}`);
+    }
+  }
+
+  throw new Error(`ALIPAY_PRIVATE_KEY 无法解析，请检查私钥是否复制完整、是否混入引号/空格、ALIPAY_KEY_TYPE 是否正确。OpenSSL: ${errors.join(' | ')}`);
 }
 
 function normalizePublicKey(value) {
@@ -93,10 +160,10 @@ function getNotifyUrl() {
 
 function getSdk() {
   const appId = getRequiredEnv('ALIPAY_APP_ID');
-  const keyType = String(process.env.ALIPAY_KEY_TYPE || 'PKCS8').trim().toUpperCase() === 'PKCS1'
+  const configuredKeyType = String(process.env.ALIPAY_KEY_TYPE || 'PKCS8').trim().toUpperCase() === 'PKCS1'
     ? 'PKCS1'
     : 'PKCS8';
-  const privateKey = normalizePrivateKey(getRequiredEnv('ALIPAY_PRIVATE_KEY'), keyType);
+  const { privateKey, keyType } = parsePrivateKey(getRequiredEnv('ALIPAY_PRIVATE_KEY'), configuredKeyType);
   const alipayPublicKey = normalizePublicKey(getRequiredEnv('ALIPAY_PUBLIC_KEY'));
   const gateway = getGateway();
 
@@ -126,30 +193,53 @@ function getSdk() {
 
 async function ensureTables() {
   if (!tablesReadyPromise) {
-    tablesReadyPromise = execute(
-      `
-        CREATE TABLE IF NOT EXISTS payment_orders (
-          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-          out_trade_no VARCHAR(64) NOT NULL,
-          alipay_trade_no VARCHAR(128) DEFAULT NULL,
-          user_id VARCHAR(255) NOT NULL,
-          plan_id VARCHAR(64) NOT NULL,
-          subject VARCHAR(255) NOT NULL,
-          amount DECIMAL(10,2) NOT NULL,
-          status VARCHAR(40) NOT NULL DEFAULT 'pending_payment',
-          paid_at TIMESTAMP NULL DEFAULT NULL,
-          fulfilled_at TIMESTAMP NULL DEFAULT NULL,
-          raw_notify JSON DEFAULT NULL,
-          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          PRIMARY KEY (id),
-          UNIQUE KEY uk_payment_orders_out_trade_no (out_trade_no),
-          INDEX idx_payment_orders_user_status (user_id, status),
-          INDEX idx_payment_orders_user_created (user_id, created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-      `,
-      []
-    ).catch((error) => {
+    tablesReadyPromise = (async () => {
+      await execute(
+        `
+          CREATE TABLE IF NOT EXISTS payment_orders (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+            out_trade_no VARCHAR(64) NOT NULL COMMENT '本系统商户订单号，AC+时间戳+随机串；唯一',
+            alipay_trade_no VARCHAR(128) DEFAULT NULL COMMENT '支付宝交易号，支付通知返回的 trade_no',
+            user_id VARCHAR(255) NOT NULL COMMENT '用户ID，来自插件端用户标识',
+            plan_id VARCHAR(64) NOT NULL COMMENT '套餐ID枚举：blog_250=博客列表基础包，as_50=高AS博客精选包',
+            subject VARCHAR(255) NOT NULL COMMENT '支付订单标题，来自套餐 subject',
+            amount DECIMAL(10,2) NOT NULL COMMENT '订单金额，单位：元',
+            status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付待人工发货，fulfilled=已发货，closed=已关闭，failed=异常或失败',
+            paid_at TIMESTAMP NULL DEFAULT NULL COMMENT '首次确认支付成功时间；支付宝 trade_status 为 TRADE_SUCCESS 或 TRADE_FINISHED 时写入',
+            fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '人工发货完成时间',
+            raw_notify JSON DEFAULT NULL COMMENT '最近一次支付宝异步通知原文JSON；trade_status 参考：WAIT_BUYER_PAY=等待买家付款，TRADE_SUCCESS=支付成功，TRADE_FINISHED=交易结束，TRADE_CLOSED=交易关闭',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间',
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_payment_orders_out_trade_no (out_trade_no),
+            INDEX idx_payment_orders_user_status (user_id, status),
+            INDEX idx_payment_orders_user_created (user_id, created_at)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付宝支付订单表'
+        `,
+        []
+      );
+
+      await execute(
+        `
+          ALTER TABLE payment_orders
+            MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+            MODIFY out_trade_no VARCHAR(64) NOT NULL COMMENT '本系统商户订单号，AC+时间戳+随机串；唯一',
+            MODIFY alipay_trade_no VARCHAR(128) DEFAULT NULL COMMENT '支付宝交易号，支付通知返回的 trade_no',
+            MODIFY user_id VARCHAR(255) NOT NULL COMMENT '用户ID，来自插件端用户标识',
+            MODIFY plan_id VARCHAR(64) NOT NULL COMMENT '套餐ID枚举：blog_250=博客列表基础包，as_50=高AS博客精选包',
+            MODIFY subject VARCHAR(255) NOT NULL COMMENT '支付订单标题，来自套餐 subject',
+            MODIFY amount DECIMAL(10,2) NOT NULL COMMENT '订单金额，单位：元',
+            MODIFY status VARCHAR(40) NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态枚举：pending_payment=待支付，paid_pending_fulfillment=已支付待人工发货，fulfilled=已发货，closed=已关闭，failed=异常或失败',
+            MODIFY paid_at TIMESTAMP NULL DEFAULT NULL COMMENT '首次确认支付成功时间；支付宝 trade_status 为 TRADE_SUCCESS 或 TRADE_FINISHED 时写入',
+            MODIFY fulfilled_at TIMESTAMP NULL DEFAULT NULL COMMENT '人工发货完成时间',
+            MODIFY raw_notify JSON DEFAULT NULL COMMENT '最近一次支付宝异步通知原文JSON；trade_status 参考：WAIT_BUYER_PAY=等待买家付款，TRADE_SUCCESS=支付成功，TRADE_FINISHED=交易结束，TRADE_CLOSED=交易关闭',
+            MODIFY created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+            MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录最后更新时间',
+            COMMENT='支付宝支付订单表'
+        `,
+        []
+      );
+    })().catch((error) => {
       tablesReadyPromise = null;
       throw error;
     });
@@ -174,6 +264,26 @@ function formatDate(value) {
   return value instanceof Date ? value.toISOString() : value || null;
 }
 
+function getOrderCreatedTime(row) {
+  const createdAt = row && row.created_at;
+  if (createdAt instanceof Date) return createdAt.getTime();
+  const timestamp = Date.parse(createdAt);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function getPendingOrderExpiresAt(row) {
+  if (!row || row.status !== 'pending_payment') return null;
+  const createdTime = getOrderCreatedTime(row);
+  if (!createdTime) return null;
+  return new Date(createdTime + PAYMENT_TIMEOUT_MS);
+}
+
+function getPendingOrderRemainingSeconds(row) {
+  const expiresAt = getPendingOrderExpiresAt(row);
+  if (!expiresAt) return null;
+  return Math.max(0, Math.ceil((expiresAt.getTime() - Date.now()) / 1000));
+}
+
 function buildPurchaseStatus(row) {
   if (!row) {
     return {
@@ -184,7 +294,7 @@ function buildPurchaseStatus(row) {
   }
 
   const plan = getPlan(row.plan_id);
-  return {
+  const result = {
     success: true,
     status: row.status,
     statusText: STATUS_TEXT[row.status] || row.status,
@@ -195,6 +305,26 @@ function buildPurchaseStatus(row) {
     fulfilledAt: formatDate(row.fulfilled_at),
     createdAt: formatDate(row.created_at)
   };
+  const expiresAt = getPendingOrderExpiresAt(row);
+  if (expiresAt) {
+    result.expiresAt = expiresAt.toISOString();
+    result.remainingSeconds = getPendingOrderRemainingSeconds(row);
+  }
+  return result;
+}
+
+async function closeExpiredPendingOrders(userId) {
+  await execute(
+    `
+      UPDATE payment_orders
+      SET status = 'closed',
+          updated_at = NOW()
+      WHERE user_id = ?
+        AND status = 'pending_payment'
+        AND created_at < DATE_SUB(NOW(), INTERVAL 2 HOUR)
+    `,
+    [userId]
+  );
 }
 
 async function findActiveOrder(userId) {
@@ -211,13 +341,18 @@ async function findActiveOrder(userId) {
   );
 }
 
-async function findLatestOrder(userId) {
+async function findDisplayOrder(userId) {
   return queryOne(
     `
       SELECT *
       FROM payment_orders
       WHERE user_id = ?
-      ORDER BY created_at DESC
+      ORDER BY CASE
+          WHEN status = 'pending_payment' THEN 0
+          WHEN status = 'paid_pending_fulfillment' THEN 1
+          ELSE 2
+        END,
+        created_at DESC
       LIMIT 1
     `,
     [userId]
@@ -248,7 +383,8 @@ function buildPayUrl({ outTradeNo, plan }) {
       product_code: 'FAST_INSTANT_TRADE_PAY',
       total_amount: plan.amount,
       subject: plan.subject,
-      body: plan.body
+      body: plan.body,
+      timeout_express: PAYMENT_TIMEOUT_EXPRESS
     }
   });
 }
@@ -272,6 +408,7 @@ async function createOrder(req, res) {
 
   try {
     await ensureTables();
+    await closeExpiredPendingOrders(normalizedUserId);
 
     conn = await getPool().getConnection();
     lockName = `payment_order:${normalizedUserId}`;
@@ -298,6 +435,31 @@ async function createOrder(req, res) {
       [normalizedUserId, ACTIVE_ORDER_STATUSES[0], ACTIVE_ORDER_STATUSES[1]]
     );
     const activeOrder = activeRows && activeRows[0];
+    if (activeOrder && activeOrder.status === 'pending_payment') {
+      const activePlan = getPlan(activeOrder.plan_id);
+      if (!activePlan) {
+        return res.status(409).json({
+          success: false,
+          code: 'ACTIVE_ORDER_EXISTS',
+          message: '你有一笔待支付订单，请先完成或等待订单关闭',
+          order: buildPurchaseStatus(activeOrder)
+        });
+      }
+      return res.status(200).json({
+        success: true,
+        reused: true,
+        outTradeNo: activeOrder.out_trade_no,
+        payUrl: buildPayUrl({ outTradeNo: activeOrder.out_trade_no, plan: activePlan }),
+        env: getAlipayEnv(),
+        order: buildPurchaseStatus(activeOrder),
+        plan: {
+          id: activePlan.id,
+          name: activePlan.name,
+          amount: activePlan.amount
+        }
+      });
+    }
+
     const activeOrderError = getActiveOrderError(activeOrder);
     if (activeOrderError) {
       return res.status(409).json({
@@ -325,6 +487,8 @@ async function createOrder(req, res) {
       outTradeNo,
       payUrl,
       env: getAlipayEnv(),
+      expiresAt: new Date(Date.now() + PAYMENT_TIMEOUT_MS).toISOString(),
+      remainingSeconds: PAYMENT_TIMEOUT_SECONDS,
       plan: {
         id: plan.id,
         name: plan.name,
@@ -460,8 +624,10 @@ async function purchaseStatus(req, res) {
 
   try {
     await ensureTables();
-    const latestOrder = await findLatestOrder(userId.trim());
-    return res.status(200).json(buildPurchaseStatus(latestOrder));
+    const normalizedUserId = userId.trim();
+    await closeExpiredPendingOrders(normalizedUserId);
+    const displayOrder = await findDisplayOrder(normalizedUserId);
+    return res.status(200).json(buildPurchaseStatus(displayOrder));
   } catch (error) {
     console.error('[alipay] purchase-status failed:', error);
     return res.status(500).json({
@@ -481,12 +647,18 @@ async function listOrders(req, res) {
 
   try {
     await ensureTables();
+    await closeExpiredPendingOrders(userId.trim());
     const rows = await query(
       `
         SELECT *
         FROM payment_orders
         WHERE user_id = ?
-        ORDER BY created_at DESC
+        ORDER BY CASE
+            WHEN status = 'pending_payment' THEN 0
+            WHEN status = 'paid_pending_fulfillment' THEN 1
+            ELSE 2
+          END,
+          created_at DESC
         LIMIT 20
       `,
       [userId.trim()]
@@ -544,13 +716,22 @@ function returnPage(req, res) {
 </html>`);
 }
 
+function configDiagnostics(req, res) {
+  res.status(200).json({
+    success: true,
+    diagnostics: getConfigDiagnostics()
+  });
+}
+
 router.post('/alipay/create-order', createOrder);
 router.post('/alipay/notify', handleNotify);
 router.get('/alipay/return', returnPage);
+router.get('/alipay/config-diagnostics', configDiagnostics);
 router.get('/purchase-status', purchaseStatus);
 router.get('/alipay/orders', listOrders);
 
 router.ensureTables = ensureTables;
+router.logConfigDiagnostics = logConfigDiagnostics;
 router.PLANS = PLANS;
 router.STATUS_TEXT = STATUS_TEXT;
 

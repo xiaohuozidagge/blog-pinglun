@@ -4,6 +4,7 @@
   "description": "Auto Comment Filler Backend API",
   "main": "server.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "start": "node server.js",
     "dev": "node server.js",
     "pm2:start": "pm2 start server.js --name auto-comment-api",
