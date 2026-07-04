@@ -8,7 +8,12 @@ const { execute, getPool, query, queryOne } = require('./db');
 
 const router = express.Router();
 
-const EXPORT_BATCH_SIZE = Number(process.env.CSV_EXPORT_BATCH_SIZE || 250);
+function normalizePositiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+const EXPORT_BATCH_SIZE = normalizePositiveInteger(process.env.CSV_EXPORT_BATCH_SIZE, 250);
 const EXPORT_LOCK_NAME = 'csv_batch_export';
 const CSV_STORAGE_DIR = path.resolve(__dirname, '..', 'storage', 'csv-batches');
 const CSV_BATCH_PLAN_ID = 'csv_batch';
@@ -387,9 +392,9 @@ async function fetchExportRows(conn) {
       LEFT JOIN csv_batch_items i ON i.blog_run_stat_id = s.id
       WHERE i.id IS NULL
       ORDER BY s.created_at ASC, s.id ASC
-      LIMIT ?
+      LIMIT ${EXPORT_BATCH_SIZE}
     `,
-    [EXPORT_BATCH_SIZE]
+    []
   );
   return rows;
 }
