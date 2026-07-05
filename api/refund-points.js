@@ -3,11 +3,17 @@ const router = express.Router();
 
 const { execute, queryOne } = require('./db');
 
-const POINTS_REFUND = 1; // 每次补偿积分数量
-const DAILY_REFUND_LIMIT = 50; // 每个用户每天最多补偿次数
+const POINTS_REFUND = 1;
+const DAILY_REFUND_LIMIT = 50;
+
+const USER_NOT_FOUND_RESPONSE = {
+  success: false,
+  code: 'USER_NOT_FOUND',
+  error: 'User ID must be manually assigned by an administrator'
+};
 
 /**
- * 补偿积分
+ * Refund user points.
  * POST /api/refund-points
  * Body: { userId, batchId, url, reason }
  */
@@ -15,12 +21,20 @@ router.post('/refund-points', async (req, res) => {
   const { userId, batchId, url, reason } = req.body || {};
 
   if (!userId) {
-    return res.status(400).json({ error: '缺少 userId 参数' });
+    return res.status(400).json({
+      success: false,
+      code: 'MISSING_USER_ID',
+      error: 'Missing userId'
+    });
   }
 
   try {
-    // 1. 检查今日补偿次数
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const userRow = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
+    if (!userRow) {
+      return res.status(404).json(USER_NOT_FOUND_RESPONSE);
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
     const countRow = await queryOne(
       `
         SELECT COUNT(*) as count FROM refund_points_log
@@ -29,19 +43,34 @@ router.post('/refund-points', async (req, res) => {
       `,
       [userId, today]
     );
-    const todayCount = countRow ? countRow.count : 0;
+    const todayCount = countRow ? Number(countRow.count) || 0 : 0;
 
     if (todayCount >= DAILY_REFUND_LIMIT) {
-      console.log(`[refund-points] 用户 ${userId} 今日补偿次数已达上限(${DAILY_REFUND_LIMIT}次)`);
+      console.log(`[refund-points] user ${userId} reached daily refund limit (${DAILY_REFUND_LIMIT})`);
       return res.status(200).json({
         success: false,
-        error: '今日补偿次数已达上限',
+        error: 'Daily refund limit reached',
         dailyLimit: DAILY_REFUND_LIMIT,
         todayCount
       });
     }
 
-    // 2. 记录补偿日志
+    const currentPoints = Number(userRow.points) || 0;
+    const newPoints = currentPoints + POINTS_REFUND;
+    const updateResult = await execute(
+      `
+        UPDATE auto_comment_users
+        SET points = points + ?,
+            updated_at = NOW()
+        WHERE user_id = ?
+      `,
+      [POINTS_REFUND, userId]
+    );
+
+    if (updateResult && updateResult.affectedRows === 0) {
+      return res.status(404).json(USER_NOT_FOUND_RESPONSE);
+    }
+
     await execute(
       `
         INSERT INTO refund_points_log (user_id, batch_id, url, points, reason, created_at)
@@ -50,21 +79,7 @@ router.post('/refund-points', async (req, res) => {
       [userId, batchId || null, url || null, POINTS_REFUND, reason || null]
     );
 
-    // 3. 给用户加积分（UPSERT）
-    const row = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
-    const currentPoints = row ? row.points : 0;
-    const newPoints = currentPoints + POINTS_REFUND;
-
-    await execute(
-      `
-        INSERT INTO auto_comment_users (user_id, points, updated_at)
-        VALUES (?, ?, NOW())
-        ON DUPLICATE KEY UPDATE points = points + VALUES(points), updated_at = NOW()
-      `,
-      [userId, POINTS_REFUND]
-    );
-
-    console.log(`[refund-points] 用户 ${userId} 补偿成功，+${POINTS_REFUND}积分，当前: ${newPoints}，今日补偿: ${todayCount + 1}/${DAILY_REFUND_LIMIT}`);
+    console.log(`[refund-points] user ${userId} refunded +${POINTS_REFUND}, remaining ${newPoints}, today ${todayCount + 1}/${DAILY_REFUND_LIMIT}`);
 
     return res.status(200).json({
       success: true,
@@ -74,8 +89,13 @@ router.post('/refund-points', async (req, res) => {
       dailyLimit: DAILY_REFUND_LIMIT
     });
   } catch (err) {
-    console.error('[refund-points] 错误：', err.message);
-    res.status(500).json({ error: '服务器内部错误', message: err.message });
+    console.error('[refund-points] error:', err.message);
+    return res.status(500).json({
+      success: false,
+      code: 'DATABASE_ERROR',
+      error: 'Internal server error',
+      message: err.message
+    });
   }
 });
 

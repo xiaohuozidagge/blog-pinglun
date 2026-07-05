@@ -94,6 +94,10 @@ function buildUserPrompt({ websiteUrl, title, description, bodyText }) {
 
 async function deductPoint(userId) {
   const row = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
+  if (!row) {
+    return { success: false, currentPoints: 0, code: 'USER_NOT_FOUND' };
+  }
+
   const currentPoints = row ? Number(row.points) : 0;
 
   if (currentPoints < POINTS_COST_PER_GENERATION) {
@@ -101,34 +105,42 @@ async function deductPoint(userId) {
   }
 
   const remainingPoints = currentPoints - POINTS_COST_PER_GENERATION;
-  await execute(
-    `
-      INSERT INTO auto_comment_users (user_id, points, updated_at)
-      VALUES (?, ?, NOW())
-      ON DUPLICATE KEY UPDATE points = VALUES(points), updated_at = NOW()
-    `,
-    [userId, remainingPoints]
+  const result = await execute(
+    'UPDATE auto_comment_users SET points = ?, updated_at = NOW() WHERE user_id = ?',
+    [remainingPoints, userId]
   );
+  if (result && result.affectedRows === 0) {
+    return { success: false, currentPoints: 0, code: 'USER_NOT_FOUND' };
+  }
 
   return { success: true, remainingPoints };
 }
 
 async function refundPoint(userId, url, reason) {
+  const row = await queryOne('SELECT points FROM auto_comment_users WHERE user_id = ?', [userId]);
+  if (!row) {
+    throw new Error('USER_NOT_FOUND');
+  }
+
+  const result = await execute(
+    `
+      UPDATE auto_comment_users
+      SET points = points + ?,
+          updated_at = NOW()
+      WHERE user_id = ?
+    `,
+    [POINTS_COST_PER_GENERATION, userId]
+  );
+  if (result && result.affectedRows === 0) {
+    throw new Error('USER_NOT_FOUND');
+  }
+
   await execute(
     `
       INSERT INTO refund_points_log (user_id, url, points, reason, created_at)
       VALUES (?, ?, ?, ?, NOW())
     `,
     [userId, url || null, POINTS_COST_PER_GENERATION, reason]
-  );
-
-  const result = await execute(
-    `
-      INSERT INTO auto_comment_users (user_id, points, updated_at)
-      VALUES (?, ?, NOW())
-      ON DUPLICATE KEY UPDATE points = points + VALUES(points), updated_at = NOW()
-    `,
-    [userId, POINTS_COST_PER_GENERATION]
   );
 
   return result;
@@ -197,6 +209,14 @@ module.exports = async function handler(req, res) {
 
     const deducted = await deductPoint(userId);
     if (!deducted.success) {
+      if (deducted.code === 'USER_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          code: 'USER_NOT_FOUND',
+          error: 'User ID must be manually assigned by an administrator'
+        });
+      }
+
       return res.status(200).json({
         success: false,
         error: '积分不足',

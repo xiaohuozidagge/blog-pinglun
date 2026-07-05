@@ -9,6 +9,7 @@ const LEGACY_PROMPT_FIELD_VALUES_STORAGE_KEY = 'auto_fill_prompt_field_values';
 
 const POINTS_API_BASE = 'https://jieyunsang.cn/api';
 const CONFIG_VERSION = 2;
+const USER_ID_NOT_ASSIGNED_MESSAGE = 'userid需要由管理员手动分配';
 
 const ACTIVE_STORAGE_KEYS = [
   WEBSITE_URL_STORAGE_KEY,
@@ -227,8 +228,28 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   if (savePointsBtn && userIdInput) {
-    savePointsBtn.addEventListener('click', () => {
+    savePointsBtn.addEventListener('click', async () => {
       const userId = userIdInput.value.trim();
+      let validatedPoints = null;
+
+      if (userId) {
+        try {
+          validatedPoints = await validateUserIdExists(userId);
+        } catch (error) {
+          console.error('validate userId failed:', error);
+          if (error && error.code === 'USER_NOT_FOUND') {
+            alert(USER_ID_NOT_ASSIGNED_MESSAGE);
+            showStatus(pointsStatusEl, USER_ID_NOT_ASSIGNED_MESSAGE, 3000);
+            setPointsBalance(null);
+            setPurchaseStatus(null);
+            return;
+          }
+          alert('校验用户ID失败，请稍后重试');
+          showStatus(pointsStatusEl, '校验失败', 3000);
+          return;
+        }
+      }
+
       chrome.storage.sync.set({ [USER_ID_STORAGE_KEY]: userId }, () => {
         if (chrome.runtime.lastError) {
           console.error('保存用户ID失败：', chrome.runtime.lastError);
@@ -237,8 +258,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         showStatus(pointsStatusEl, '已保存');
         if (userId) {
-          fetchPointsBalance(userId);
+          setPointsBalance(validatedPoints);
           fetchPurchaseStatus(userId);
+        } else {
+          setPointsBalance(null);
+          setPurchaseStatus(null);
         }
       });
     });
@@ -248,6 +272,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (pointsBalanceEl) {
       pointsBalanceEl.textContent = (points !== null && points !== undefined) ? points : '-';
     }
+  }
+
+  async function validateUserIdExists(userId) {
+    const response = await fetch(`${POINTS_API_BASE}/get-points?userId=${encodeURIComponent(userId)}`);
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 404 || data.code === 'USER_NOT_FOUND') {
+      const error = new Error(USER_ID_NOT_ASSIGNED_MESSAGE);
+      error.code = 'USER_NOT_FOUND';
+      throw error;
+    }
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to validate userId');
+    }
+    return data.points;
   }
 
   async function fetchPointsBalance(userId) {
@@ -260,6 +298,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await response.json();
       if (data.success) {
         setPointsBalance(data.points);
+      } else if (data.code === 'USER_NOT_FOUND') {
+        setPointsBalance(USER_ID_NOT_ASSIGNED_MESSAGE);
       } else {
         setPointsBalance('查询失败');
       }
