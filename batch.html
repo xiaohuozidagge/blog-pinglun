@@ -204,6 +204,15 @@
         background: #fde68a;
       }
 
+      .url-preview tr.illegal td {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+
+      .url-preview tr.illegal:hover td {
+        background: #fecaca;
+      }
+
       /* 操作按钮区域 */
       .action-bar {
         display: flex;
@@ -495,6 +504,7 @@
       .stats-table tr.url-fail td { background: #fff5f5; }
       .stats-table tr.url-skipped td { background: #fffbeb; }
       .stats-table tr.url-manual_required td { background: #fffbeb; }
+      .stats-table tr.url-blocked_illegal td { background: #fff1f2; }
 
       .result-badge {
         display: inline-block;
@@ -508,6 +518,7 @@
       .result-badge.no_comment_box { background: #fef3c7; color: #92400e; }
       .result-badge.fail { background: #fee2e2; color: #991b1b; }
       .result-badge.skipped { background: #fef3c7; color: #92400e; }
+      .result-badge.blocked_illegal { background: #ffe4e6; color: #9f1239; }
 
       .ai-content-cell {
         max-width: 200px;
@@ -545,11 +556,13 @@
       .url-preview tr.url-done-success { background: #d1fae5 !important; }
       .url-preview tr.url-done-fail { background: #fee2e2 !important; }
       .url-preview tr.url-done-skipped { background: #fef3c7 !important; }
+      .url-preview tr.url-done-blocked { background: #ffe4e6 !important; }
 
       .url-preview tr.url-processing td:first-child::after { content: ' ↻'; color: #2563eb; font-weight: 700; }
       .url-preview tr.url-done-success td:first-child::after { content: ' ✓'; color: #059669; font-weight: 700; }
       .url-preview tr.url-done-fail td:first-child::after { content: ' ✗'; color: #dc2626; font-weight: 700; }
       .url-preview tr.url-done-skipped td:first-child::after { content: ' —'; color: #d97706; font-weight: 700; }
+      .url-preview tr.url-done-blocked td:first-child::after { content: ' !'; color: #be123c; font-weight: 700; }
 
       /* 底部操作区 */
       .footer-actions {
@@ -803,6 +816,7 @@
             <option value="skipped">仅已存在</option>
             <option value="manual_required">仅需手动处理</option>
             <option value="no_comment_box">仅无评论框</option>
+            <option value="blocked_illegal">仅非法拦截</option>
             <option value="fail">仅失败</option>
           </select>
           <select id="filterDomain">
@@ -846,6 +860,7 @@
     </div>
 
     <script src="lib/papaparse.min.js"></script>
+    <script src="illegal-site-filter.js"></script>
     <script src="batch.js"></script>
   </body>
 </html>

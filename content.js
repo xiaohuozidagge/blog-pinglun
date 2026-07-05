@@ -3819,6 +3819,59 @@
   /**
    * 批量模式：自动完成评论流程并上报结果
    */
+  function getMetaContent(selector) {
+    const el = document.querySelector(selector);
+    return el ? (el.getAttribute('content') || '') : '';
+  }
+
+  function evaluateCurrentPageForIllegalSite(url) {
+    const filter = window.AutoCommentIllegalSiteFilter;
+    if (!filter || typeof filter.evaluatePage !== 'function') {
+      console.warn('[content] 非法网站过滤器未加载，跳过页面检测');
+      return { blocked: false };
+    }
+
+    const pageText = document.body ? document.body.innerText : '';
+    return filter.evaluatePage(url || location.href, {
+      title: document.title || '',
+      description: getMetaContent('meta[name="description"], meta[property="og:description"]'),
+      keywords: getMetaContent('meta[name="keywords"]'),
+      text: pageText
+    });
+  }
+
+  async function reportIllegalSiteAndClose(batchId, urlIndex, url, check) {
+    const reason = (check && check.reason) || '非法网站拦截：命中赌博/色情规则';
+    console.warn('[content] 检测到非法网站，上报 blocked_illegal 并关闭网页:', { batchId, urlIndex, url, reason });
+    await writePendingResult(batchId, urlIndex, url, 'blocked_illegal', null, reason);
+
+    await new Promise((resolve) => {
+      chrome.runtime.sendMessage({
+        type: 'BATCH_HANDLE_CONFIRM',
+        batchId,
+        urlIndex,
+        url: url || location.href || '',
+        aiContent: '',
+        result: 'blocked_illegal',
+        errorMessage: reason
+      }).then((response) => {
+        console.log('[content] blocked_illegal BATCH_HANDLE_CONFIRM 响应:', response);
+        resolve(response);
+      }).catch((err) => {
+        if (err.message && err.message.includes('message channel closed')) {
+          console.log('[content] 消息通道已关闭（标签页可能已关闭），忽略错误');
+        } else {
+          console.warn('[content] blocked_illegal 发送消息失败:', err);
+        }
+        resolve(null);
+      });
+    });
+
+    setTimeout(() => {
+      window.close();
+    }, 700);
+  }
+
   async function handleBatchTask(batchId, urlIndex, url, originalIndex) {
     console.log('[content] handleBatchTask 开始 >>>', { batchId, urlIndex, url, time: new Date().toISOString() });
     let aiGenerated = false; // 标记AI是否已生成（用于失败时补偿）
@@ -3831,6 +3884,11 @@
     try {
       console.log('[content] 1/6 等待页面加载...');
       await waitForPageReady();
+      const illegalCheck = evaluateCurrentPageForIllegalSite(url);
+      if (illegalCheck.blocked) {
+        await reportIllegalSiteAndClose(batchId, urlIndex, url, illegalCheck);
+        return;
+      }
       console.log('[content] 2/6 检查是否已处理过...');
       const existingResult = await checkExistingBatchResult(batchId, url, urlIndex);
       if (existingResult) {

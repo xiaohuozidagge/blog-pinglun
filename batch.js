@@ -23,6 +23,7 @@ let failCount = 0;
 let skippedCount = 0;
 let noCommentBoxCount = 0;
 let manualRequiredCount = 0;
+let blockedIllegalCount = 0;
 let pendingCount = 0;
 
 // 本地结果存储
@@ -275,6 +276,20 @@ function processFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
+function evaluateIllegalSiteForBatchItem(url, sourceDomain) {
+  const filter = window.AutoCommentIllegalSiteFilter;
+  if (!filter || typeof filter.evaluateUrl !== 'function') {
+    console.warn('[batch] 非法网站过滤器未加载，跳过 URL 预检测');
+    return { blocked: false };
+  }
+  return filter.evaluateUrl(url, { sourceDomain });
+}
+
+function getIllegalSiteBlockMessage(check) {
+  if (!check || !check.blocked) return '';
+  return check.reason || '非法网站拦截：命中赌博/色情规则';
+}
+
 function normalizeEncoding(arrayBuffer) {
   const bytes = new Uint8Array(arrayBuffer);
   const len = bytes.length;
@@ -349,6 +364,7 @@ function parseCSV(raw, fileNameParam) {
 
   let validCount = 0;
   let invalidCount = 0;
+  let illegalCount = 0;
   parsedUrls = [];
   urlPreviewBody.innerHTML = '';
 
@@ -371,16 +387,26 @@ function parseCSV(raw, fileNameParam) {
       continue;
     }
 
+    const illegalCheck = evaluateIllegalSiteForBatchItem(url, sourceDomain);
+    if (illegalCheck.blocked) {
+      illegalCount++;
+    }
+
     parsedUrls.push({
       originalIndex: parsedUrls.length,
       url,
       sourceDomain,
+      illegalCheck: illegalCheck.blocked ? illegalCheck : null,
       originalRow: row  // 保存原始行数据，用于导出时保持格式
     });
     validCount++;
 
     const tr = document.createElement('tr');
     tr.dataset.url = url;
+    if (illegalCheck.blocked) {
+      tr.classList.add('illegal');
+      tr.title = getIllegalSiteBlockMessage(illegalCheck);
+    }
     tr.innerHTML = `<td>${parsedUrls.length}</td><td>${escapeHtml(sourceDomain || url)}</td><td>${escapeHtml(url)}</td>`;
     urlPreviewBody.appendChild(tr);
   }
@@ -403,11 +429,12 @@ function parseCSV(raw, fileNameParam) {
   uploadZone.classList.add('has-file');
   fileCount.textContent = `共 ${validCount} 条 URL`;
   if (invalidCount > 0) fileCount.textContent += `（跳过 ${invalidCount} 条无效）`;
+  if (illegalCount > 0) fileCount.textContent += `（非法拦截 ${illegalCount} 条）`;
   if (duplicateCount > 0) {
     fileCount.textContent += `（发现 ${duplicateCount} 条重复）`;
     document.getElementById('duplicateCount').textContent = `⚠️ ${duplicateCount} 条重复`;
   }
-  updateCostHint(validCount);
+  updateCostHint(Math.max(0, validCount - illegalCount));
   startBtn.disabled = validCount === 0;
 }
 
@@ -483,6 +510,7 @@ async function startBatch() {
   skippedCount = 0;
   noCommentBoxCount = 0;
   manualRequiredCount = 0;
+  blockedIllegalCount = 0;
   pendingCount = totalCount;
   currentIndex = 0;
   localResults = [];
@@ -588,7 +616,7 @@ async function resumeBatch() {
   isOpeningTab = false;  // 重置锁，确保可以继续打开
 
   // 重置待处理计数（仅统计还未处理的）
-  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
+  const processedCount = getProcessedCount();
   pendingCount = totalCount - processedCount;
   const processedIndices = new Set(localResults.map((r) => r.originalIndex));
   let nextIndex = currentIndex;
@@ -645,9 +673,23 @@ async function openNextTab() {
   }
 
   const urlIndex = currentIndex;
-  const { url } = parsedUrls[urlIndex];
+  const item = parsedUrls[urlIndex];
+  const { url, sourceDomain } = item;
   console.log('[openNextTab] 准备打开标签页', { urlIndex, url });
   currentIndex++;
+
+  const illegalCheck = item.illegalCheck || evaluateIllegalSiteForBatchItem(url, sourceDomain);
+  if (illegalCheck.blocked) {
+    console.warn('[batch] 命中非法网站规则，跳过打开标签页:', { urlIndex, url, illegalCheck });
+    item.illegalCheck = illegalCheck;
+    handleTabResult(urlIndex, 'blocked_illegal', null, getIllegalSiteBlockMessage(illegalCheck), 0);
+    if (status === 'running' && currentIndex < totalCount) {
+      setTimeout(openNextTabSync, 0);
+    } else if (status === 'running' && activeTabCount === 0) {
+      checkAllCompleted();
+    }
+    return;
+  }
 
   try {
     chrome.tabs.create({ url, active: true }, (tab) => {
@@ -804,12 +846,15 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
   } else if (result === 'manual_required') {
     manualRequiredCount++;
     highlightPreviewRow(urlIndex, 'manual_required');
+  } else if (result === 'blocked_illegal') {
+    blockedIllegalCount++;
+    highlightPreviewRow(urlIndex, 'blocked_illegal');
   } else {
     failCount++;
     highlightPreviewRow(urlIndex, 'fail');
   }
 
-  pendingCount = totalCount - successCount - failCount - skippedCount - noCommentBoxCount - manualRequiredCount;
+  pendingCount = totalCount - getProcessedCount();
   updateStatsUI();
   renderStats();
 
@@ -817,7 +862,7 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
   saveLocalResults();
 
   // 检查是否全部完成（成功 + 失败 + 已跳过 + 无评论框 >= 总数）
-  const processedCount = successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
+  const processedCount = getProcessedCount();
   console.log('[batch] handleTabResult 完成检查:', {
     urlIndex,
     result,
@@ -825,6 +870,7 @@ function handleTabResult(urlIndex, result, aiContent, errorMessage, forcedElapse
     failCount,
     skippedCount,
     manualRequiredCount,
+    blockedIllegalCount,
     processedCount,
     totalCount,
     shouldComplete: processedCount >= totalCount
@@ -939,7 +985,7 @@ function handleTabConfirmed(urlIndex, result, aiContent, errorMessage) {
 }
 
 function getProcessedCount() {
-  return successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount;
+  return successCount + failCount + skippedCount + noCommentBoxCount + manualRequiredCount + blockedIllegalCount;
 }
 
 function checkAllCompleted(options = {}) {
@@ -1102,7 +1148,7 @@ function updateUI() {
 
   // 终止状态下可重新开始，将待处理计数恢复
   if (isTerminated) {
-    pendingCount = totalCount - successCount - failCount - skippedCount - noCommentBoxCount - manualRequiredCount;
+    pendingCount = totalCount - getProcessedCount();
     updateStatsUI();
   }
 }
@@ -1185,7 +1231,7 @@ function getExportSourceColumnCount(originalRow) {
   if (len <= 0) return 0;
 
   const lastValue = String(originalRow[len - 1] || '').trim();
-  const knownResultValues = new Set(['√', '×', '需手动处理', '成功', '失败']);
+  const knownResultValues = new Set(['√', '×', '需手动处理', '成功', '失败', '非法站点，已拦截']);
   if (knownResultValues.has(lastValue)) {
     return len - 1;
   }
@@ -1196,13 +1242,14 @@ function getExportSourceColumnCount(originalRow) {
 function getExportRunResult(result) {
   if (result === 'success' || result === 'skipped') return '√';
   if (result === 'manual_required') return '需手动处理';
+  if (result === 'blocked_illegal') return '非法站点，已拦截';
   return '×';
 }
 
 function clearBatch() {
   resetFile();
   batchId = null;
-  totalCount = successCount = failCount = skippedCount = noCommentBoxCount = manualRequiredCount = pendingCount = 0;
+  totalCount = successCount = failCount = skippedCount = noCommentBoxCount = manualRequiredCount = blockedIllegalCount = pendingCount = 0;
   currentIndex = 0;
   localResults = [];
   activeTabs.clear();
@@ -1245,11 +1292,12 @@ function findPreviewRowByIndex(urlIndex) {
 function highlightPreviewRow(urlIndex, state) {
   const row = findPreviewRowByIndex(urlIndex);
   if (!row) return;
-  row.classList.remove('url-processing', 'url-done-success', 'url-done-fail', 'url-done-skipped');
+  row.classList.remove('url-processing', 'url-done-success', 'url-done-fail', 'url-done-skipped', 'url-done-blocked');
   if (state === 'processing') row.classList.add('url-processing');
   else if (state === 'success') row.classList.add('url-done-success');
   else if (state === 'fail') row.classList.add('url-done-fail');
   else if (state === 'skipped' || state === 'manual_required') row.classList.add('url-done-skipped');
+  else if (state === 'blocked_illegal') row.classList.add('url-done-blocked');
 }
 
 function clearPreviewRow(urlIndex) {
@@ -1543,6 +1591,7 @@ function getResultText(result) {
     case 'skipped': return '已存在';
     case 'manual_required': return '需手动处理';
     case 'no_comment_box': return '无评论框';
+    case 'blocked_illegal': return '非法拦截';
     case 'fail': return '失败';
     default: return result;
   }
